@@ -7,7 +7,7 @@ from craft_partner_ranking.client import ProductClient, RemoteError
 from craft_partner_ranking.data import load_bundle
 from craft_partner_ranking.service import running_service
 from craft_partner_ranking.store import ArtifactStore
-from craft_partner_ranking.workflow import publish_overview
+from craft_partner_ranking.workflow import publish_candidates, publish_overview
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +41,61 @@ class IntegrationTests(unittest.TestCase):
     def test_overview_roundtrip(self):
         value = publish_overview(self.client, "2026-01-01", "http-overview")
         self.assertEqual(self.client.artifact(value["artifact_id"]), value["artifact"])
+
+    def test_candidate_publish_keeps_model_and_data_basis(self):
+        value = publish_candidates(self.client, "2026-01-01", "http-candidates")
+        artifact = value["artifact"]
+        self.assertEqual(artifact["method"], "candidate-yield-v1")
+        self.assertIn("model", artifact)
+        self.assertIn("data_basis", artifact)
+        self.assertEqual(artifact["model"]["method"], "candidate-yield-v1")
+        self.assertEqual(artifact["data_basis"]["snapshot_id"], artifact["snapshot_id"])
+        self.assertTrue(artifact["result"]["candidates"])
+        self.assertEqual(self.client.artifact(value["artifact_id"]), artifact)
+
+    def test_candidate_publish_replay_is_stable(self):
+        first = publish_candidates(self.client, "2026-01-01", "http-candidate-replay")
+        second = publish_candidates(self.client, "2026-01-01", "http-candidate-replay")
+        self.assertEqual(first["artifact_id"], second["artifact_id"])
+        self.assertEqual(first["artifact"], second["artifact"])
+
+    def test_later_correction_cannot_rewrite_published_list(self):
+        bundle = load_bundle(ROOT / "fixtures/bundle.json")
+        path = str(Path(self.directory.name) / "corrected.sqlite3")
+        store = ArtifactStore(path, bundle.get("policy"))
+        try:
+            with running_service(bundle, store) as base:
+                client = ProductClient(base)
+                published = publish_candidates(client, "2026-01-01", "before-correction", {"draws": 400})
+                original = client.artifact(published["artifact_id"])
+                corrected = load_bundle(ROOT / "fixtures/bundle.json")
+                corrected["tables"]["corrections"].append(
+                    {
+                        "id": "correction-new",
+                        "revision": 1,
+                        "released_at": "2026-02-01",
+                        "target": "5-0",
+                        "field": "achieved",
+                        "value": 7,
+                        "reason": "后续复核",
+                    }
+                )
+                with running_service(corrected, store) as corrected_base:
+                    corrected_client = ProductClient(corrected_base)
+                    # 同一发布键换用不同日期的成果会被拒绝，旧名单不能被顶替。
+                    with self.assertRaises(RemoteError) as error:
+                        publish_candidates(corrected_client, "2026-02-01", "before-correction", {"draws": 400})
+                    self.assertEqual(error.exception.status, 409)
+                    self.assertEqual(corrected_client.artifact(published["artifact_id"]), original)
+                    # 复核后形成一份新分析，旧成果保持原样。
+                    newer = publish_candidates(corrected_client, "2026-02-01", "after-correction", {"draws": 400})
+                    self.assertNotEqual(newer["artifact_id"], published["artifact_id"])
+                    self.assertIn("correction-new", newer["artifact"]["data_basis"]["applied_corrections"])
+                    self.assertNotIn("correction-new", original["data_basis"]["applied_corrections"])
+                    self.assertNotEqual(newer["artifact"]["snapshot_id"], original["snapshot_id"])
+                    self.assertEqual(corrected_client.artifact(published["artifact_id"]), original)
+        finally:
+            store.close()
 
     def test_exact_request_replay(self):
         artifact = self.artifact()
